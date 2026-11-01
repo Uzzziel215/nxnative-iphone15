@@ -1,3 +1,7 @@
+> **nxnative-iphone15** — fork of [seedds/nxnative](https://github.com/seedds/nxnative) for iPhones whose GPU cannot read BC textures (A15 / A16: iPhone 13, 14, 15, 15 Plus).
+> On those devices the BC textures are decoded on the CPU at load time (based on upstream PR #488 by v0lumehi, closed unmerged), instead of the app refusing to start.
+> Experimental and untested on a device: loads are slower and textures take 4–8× the memory. NVN games only; Vulkan / OpenGL games (Hades, Super Mario Galaxy 1 and 2, Balatro) still create BC textures and will miss them.
+
 # nxnative
 
 Play your own Nintendo Switch games natively on iPhone and iPad. Bring your game (its NSP files) and your `prod.keys`; one script turns them into an IPA that you sideload.

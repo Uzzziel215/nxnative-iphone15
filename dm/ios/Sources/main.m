@@ -104,11 +104,10 @@ const char *front_ios_device_check(void) {
     static char msg[320]; static int done;
     if (done++) return msg[0] ? msg : NULL;
     id<MTLDevice> gpu = MTLCreateSystemDefaultDevice();   // the system default device, the one the graphics layers take (mtl_init repeats this check for the other routes)
-    if (gpu.supportsBCTextureCompression) return NULL;
-    snprintf(msg, sizeof msg, "This device's GPU (%s) cannot read BC-compressed textures, which the games use. It needs an iPhone 15 Pro or newer (A17 Pro chip or later) or an iPad with an M1 chip or later.",
-             gpu ? gpu.name.UTF8String : "no Metal device");
-    fprintf(stderr, "[RED] boot: %s\n", msg);
-    return msg;
+    if (!gpu) { snprintf(msg, sizeof msg, "No Metal device."); fprintf(stderr, "[RED] boot: %s\n", msg); return msg; }
+    // nxnative-iphone15: a GPU without BC formats (A15 / A16) no longer refuses to start; mtl_init decodes the BC textures on the CPU (nvn_bcdec.c)
+    if (!gpu.supportsBCTextureCompression) fprintf(stderr, "[boot] %s cannot read BC textures: decoding them on the CPU (slower loads, more memory)\n", gpu.name.UTF8String);
+    return NULL;
 }
 static void romfs_identity_report(NSString *doc) {
     romfs_id want, got;
