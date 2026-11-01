@@ -38,6 +38,7 @@ static size_t level_blocks(unsigned layer, unsigned level, uint8_t *out) {
 // Reads one level and layer of a private Metal texture into `out` (bytes per row `row`)
 static void read_level(id<MTLTexture> t, unsigned layer, unsigned level, uint8_t *out, size_t row, size_t rows) {
     id<MTLBuffer> buf = [g_dev newBufferWithLength:row * rows options:MTLResourceStorageModeShared];
+    if (!buf) { fprintf(stderr, "readback buffer of %zu bytes failed\n", row * rows); abort(); }
     id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
     unsigned w, h; level_size(level, &w, &h);
     if (mtl_fmt_block(t.pixelFormat)) { w = (w + 3) / 4 * 4; h = (h + 3) / 4 * 4; }
