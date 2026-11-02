@@ -74,6 +74,8 @@ ALLOW_SHADER_REGRESSIONS = False        # shaders that translated in this game's
 ALLOW_OTHER_METAL = False               # an NVN game's shaders are built only with the Metal compiler they were tested with (dm/gfx/tools/dmsh_chain.lock: Xcode 27.2); another one stops the build,
                                         #   as its shaders can render wrong pictures (GitHub issue #242). True builds them with this Mac's Metal compiler anyway
 PROVISIONAL = False                     # build from a provisional profile even when dm/games has one for the game (to test the guesses; the profile goes to PROFILE_OUT / <build folder>/profile)
+GLSLC_ON_DEVICE = False                 # a game that compiles shaders at run time, built where the Mac host cannot boot it (a virtual Mac without Metal 4): no Mac capture; the app saves the outputs on the iPhone instead (DM_GLSLC_CAPTURE=glslc_capture in its env file → Documents/glslc_capture), and the next build reads them from GLSLC_FILES
+GLSLC_FILES = ''                        # a folder of .glslc files captured on the device (Documents/glslc_capture): copied into the packed version's glslc_capture, the Mac capture is then reused
 HEAP_CHECK = True                       # a provisional profile whose game has virtual address memory and sets a heap: boot it on the Mac until its heap request (a few seconds) to size the heap region; with virtual address memory, the address region check too (also for a derived profile)
 HEAP_CHECK_SECS = 30                    # the longest heap check (it stops at the first heap request, or HEAP_CHECK_NNMAIN_SECS into nnMain without one)
 HEAP_CHECK_NNMAIN_SECS = 5
@@ -2295,6 +2297,8 @@ def parse_args(argv):
                     'it must be one the game supports, which the console lists')
     ap.add_argument('--keep-extracted', action=argparse.BooleanOptionalAction, help='keep the extracted game files after the IPA is built, for the next build (default: the KEEP_EXTRACTED setting, on)')
     ap.add_argument('--work-dir', help='the game\'s build folder, used as it is (default: the WORK_DIR setting, else <title ID>_build in the NSP folder); the extracted files, shader cache and temporary files live there, and the IPA or Mac app defaults to the folder holding it')
+    ap.add_argument('--glslc-on-device', action='store_true', help='a game that compiles shaders at run time: skip the Mac capture (a virtual Mac cannot boot the game) and build an app that saves them to Documents/glslc_capture on the iPhone')
+    ap.add_argument('--glslc-files', help='a folder of .glslc files captured on the device (Documents/glslc_capture of an app built with --glslc-on-device): the shaders go into this build')
     ap.add_argument('--env-file', help='environment switches for a diagnostic build (one KEY=VALUE per line)')
     ap.add_argument('--gpu', help='NVN games: GPU architectures the app gets its pipeline archive for, made on this Mac with metal-tt, comma-separated: g18p (A19 / A19 Pro), or the name a device\'s log gives when the app has no archive for its GPU; '
                     'none = no archive, the device builds the bases on its first start (default: the PSO_GPUS setting; when that is empty, a profile with pso_mtl4 on uses its pso_gpu key or g18p, and other profiles use none). '
@@ -2564,7 +2568,20 @@ def main(args=None):
             else: say('no heap check: it boots the game in the Mac host, which needs a Mac with Apple silicon; the profile keeps its guessed heap keys')
         if HEAP_CHECK and not args.no_heap_check and pg.has_va(game / 'ExeFS') and not region_checked(g, patched) and apple_silicon():   # where its address regions reach (a derived build too: the registered builds' cuts do not reach it)
             PROG.add(1); g = region_check(repo, game, patched, work, env, logs, g)
-    if glslc: capture_glslc(repo, {v: dirs[v] for v in sv}, pkg_ver, patched, work, env, logs, g)
+    on_device = glslc and (args.glslc_on_device or GLSLC_ON_DEVICE)
+    files = args.glslc_files or GLSLC_FILES
+    if glslc and files:   # outputs captured on the iPhone: they stand in for the Mac capture (capture_glslc then reuses them)
+        cap_src = Path(os.path.expanduser(files)); cap_dst = dirs[pkg_ver] / 'glslc_capture'
+        got = sorted(cap_src.glob('*.glslc')) if cap_src.is_dir() else []
+        if not got: raise BuildError(f'--glslc-files: no .glslc files in {cap_src}')
+        cap_dst.mkdir(parents=True, exist_ok=True)
+        for gf in got: shutil.copy2(gf, cap_dst / gf.name)
+        say(f'run-time shaders captured on the device: {len(got)} from {cap_src}')
+        on_device = False
+    if on_device:
+        say('[RED] run-time shaders: no Mac capture (--glslc-on-device); the app saves them to Documents/glslc_capture on the iPhone, for the next build (--glslc-files). '
+            'Until then the game draws nothing with them')
+    elif glslc: capture_glslc(repo, {v: dirs[v] for v in sv}, pkg_ver, patched, work, env, logs, g)
     if uedec: decode_ue_shaders(repo, {v: dirs[v] for v in sv}, pkg_ver, patched, work, env, logs, g)
     sh = work / 'shader'
     if gfx == 'vulkan':   # the packed version's merged RomFS holds the SPIR-V files the game loads; a capture holds those it generates
@@ -2595,6 +2612,10 @@ def main(args=None):
     icon = next((d / 'icon.jpg' for d in (game, base) if (d / 'icon.jpg').exists()), None)   # the game icon nx_extract saved from the control data (English, icon.jpg); the packed version's first, then the base game's
     motion = MOTION if args.motion is None else args.motion
     env_file = build_env_file(work, args.env_file or DM_ENV_FILE, motion)
+    if on_device:   # the app saves its run-time compile outputs (a relative DM_GLSLC_CAPTURE is under Documents, dm/ios/Sources/main.m)
+        pairs = env_file_pairs(env_file) if env_file else {}
+        pairs['DM_GLSLC_CAPTURE'] = 'glslc_capture'
+        f = work / 'build_env_glslc.txt'; f.write_text(''.join(f'{k}={v}\n' for k, v in pairs.items())); env_file = str(f)
     if not motion: say('motion (gyro): off, DM_MOTION=0 is built in (on the iPhone, DM_MOTION=1 in the app\'s Documents/env.txt turns it back on)')
     if mac_pack:   # a Mac app: the Mac host, then the app packed from it and the build's files
         host, font = mac_host(py, repo, work, env, logs, g)

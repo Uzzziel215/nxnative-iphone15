@@ -159,6 +159,9 @@ static int boot_env(void) {
             if (!getenv(k.UTF8String)) { setenv(k.UTF8String, v.UTF8String, 0); [from_file addObject:k]; fprintf(stderr, "boot: env %s=%s (%s)\n", k.UTF8String, v.UTF8String, ef.lastPathComponent.UTF8String); }
         }
     }
+    // A relative DM_GLSLC_CAPTURE (scripts/build_ipa_from_nsp.py --glslc-on-device bakes in "glslc_capture") is a folder in Documents, which the Files app shows
+    const char *cap = getenv("DM_GLSLC_CAPTURE");
+    if (cap && *cap && *cap != '/') setenv("DM_GLSLC_CAPTURE", [doc stringByAppendingPathComponent:@(cap)].fileSystemRepresentation, 1);
     setenv("DM_ENV_FILE_KEYS", [from_file componentsJoinedByString:@" "].UTF8String, 1);   // the launcher keeps what an env file set (LauncherSettings.swift)
     setenv("DM_ENV_LAUNCH_KEYS", [from_launch componentsJoinedByString:@" "].UTF8String, 1);   // and what the launch environment set (docs/frontends.md, Saved choices)
     front_hud_env();   // an env file's DM_METAL_HUD; nothing in this process makes a Metal device before startGame (front_ios.m), which applies the launcher's
