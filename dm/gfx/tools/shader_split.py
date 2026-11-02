@@ -54,7 +54,7 @@
 #   With an update: give RomFS and main as comma-separated lists (base game first, e.g. data/v0/RomFS,data/v327680/RomFS); the output is the union of both versions (see main())
 #   Unity type trees need Unity's common string table, which is taken from the first main
 # Pair table: (vertex key, pixel key) of every BNSH variation (every Unity program); dmsh_build uses it to give vertex shaders the outputs their pixel shaders read but they do not write (see dmsh_build.py vs_pad)
-import base64, collections, concurrent.futures as cf, hashlib, json, os, re, struct, subprocess, sys, time, zlib
+import base64, collections, concurrent.futures as cf, hashlib, json, lzma, os, re, struct, subprocess, sys, time, zlib
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../tools'))
 from romfs import os, open, is_image
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../games')); import game as _game
@@ -2406,6 +2406,69 @@ def bnd2_shaders(d, label):
         if b'\x91\x68\x86\x19' in r: found += glslc_shaders(r, f'{label}/{rid:016x}.{typ:x}.{k}', need=False)
     return found
 
+IGA = b'IGA\x1a'
+
+def iga_members(d, label, want=lambda name: True):
+    """The members of a Vicarious Visions Alchemy archive (IGA version 0xd, Crash Team Racing Nitro-Fueled's .pak) whose name want() accepts → [(name, data)].
+    Header (u32): +0x04 version, +0x08 table length (from +0x38), +0x0c member count n, +0x10 sector size (0x800), +0x1c / +0x20 / +0x24 large (u32) / medium (u16) / small (u8) block
+    counts, +0x28 name table offset (u64), +0x30 its length. From +0x38: n name hashes, n 16-byte members {offset, ?, length, mode}, then the three block tables.
+    A mode of 0xffffffff is a stored member; else its low 28 bits index the block table chosen by the member's length (up to 0x7f sectors small, 0x7fff medium, else large), one entry
+    per 0x8000 bytes of the member: the top bit set = an LZMA block, the rest = its position in sectors (relative to the member's first entry). An LZMA block is u32 compressed
+    length, 5 bytes of LZMA1 properties, the stream. The name table: n u32 offsets (from the table), each to the member's build path then its archive path ('shaders/Standard.igz').
+    Checked on CTR's 401 archives: 7,150 members whose whole data the probe had (alchemy_probe.py) decoded to their length"""
+    if d[:4] != IGA or len(d) < 0x38: red(f'{label}: not an IGA archive')
+    ver, tlen, n, sector = struct.unpack_from('<4I', d, 4)
+    nlarge, nmed, nsmall = struct.unpack_from('<3I', d, 0x1c)
+    noff, nlen = struct.unpack_from('<QI', d, 0x28)
+    if ver != 0xd or sector != 0x800 or 0x38 + 20 * n + 4 * nlarge + 2 * nmed + nsmall > len(d) or noff + nlen > len(d):
+        red(f'{label}: IGA version {ver:#x} ({n} members, sector {sector:#x}) is not a layout this reader knows')
+    fi = 0x38 + 4 * n; bt = fi + 16 * n
+    large = struct.unpack_from(f'<{nlarge}I', d, bt); med = struct.unpack_from(f'<{nmed}H', d, bt + 4 * nlarge)
+    small = struct.unpack_from(f'<{nsmall}B', d, bt + 4 * nlarge + 2 * nmed)
+    names = d[noff:noff + nlen]
+    out = []
+    for i in range(n):
+        o = field(names, '<I', 4 * i, f'{label} name table')[0]
+        e1 = names.find(b'\0', o); e2 = names.find(b'\0', e1 + 1) if e1 >= 0 else -1
+        if e2 < 0: red(f'{label}: name {i} at {o:#x} runs past the name table')
+        name = (names[e1 + 1:e2] or names[o:e1]).decode(errors='replace')   # the archive path; the build path when it is missing
+        if not want(name): continue
+        off, _, ln, mode = struct.unpack_from('<4I', d, fi + 16 * i)
+        if mode == 0xffffffff: out.append((name, span(d, off, ln, f'{label} {name}'))); continue
+        sectors = (ln + sector - 1) // sector
+        table, top = (small, 0x80) if sectors <= 0x7f else (med, 0x8000) if sectors <= 0x7fff else (large, 0x80000000)
+        b, nblk = mode & 0xfffffff, (ln + 0x7fff) // 0x8000
+        if b + nblk > len(table): red(f'{label} {name}: blocks {b}..{b + nblk} past the table of {len(table)}')
+        first, data = table[b] & (top - 1), bytearray()
+        for k in range(nblk):
+            e = table[b + k]; at = off + ((e & (top - 1)) - first) * sector; want_n = min(0x8000, ln - len(data))
+            if not e & top: data += span(d, at, want_n, f'{label} {name} block {k}'); continue
+            clen, p = field(d, '<IB', at, f'{label} {name} block {k}')
+            filt = {'id': lzma.FILTER_LZMA1, 'lc': p % 9, 'lp': p // 9 % 5, 'pb': p // 45, 'dict_size': struct.unpack_from('<I', d, at + 5)[0]}
+            try: data += lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=[filt]).decompress(span(d, at + 9, clen, f'{label} {name} block {k}'), want_n)
+            except lzma.LZMAError as e: red(f'{label} {name} block {k}: {e}')
+        if len(data) != ln: red(f'{label} {name}: decoded {len(data):#x} bytes, the member says {ln:#x}')
+        out.append((name, bytes(data)))
+    return out
+
+def alchemy_shaders(d, label):
+    """Shaders in an Alchemy archive's shader files (IGA, iga_members; CTR Nitro-Fueled's shaders_nx.pak: shaders/*.igz). In the decoded igz each control section is followed at once
+    by its code area (all 306 in the first MB of shaders_nx.pak; 22 of the 47 keys the iPhone log missed came from those). Only shaders/ members are decoded: the other 9 GB of
+    archives hold no control section (none in the 7,150 members the probe decoded outside shaders_nx.pak)"""
+    out = []
+    for name, m in iga_members(d, label, lambda nm: nm.startswith('shaders/')):
+        c = m.find(CTL_MAGIC)
+        while c >= 0:
+            nctl = struct.unpack_from('<I', m, c + 0x20)[0] if c + 0x708 <= len(m) else 0
+            ncode = struct.unpack_from('<I', m, c + 0x704)[0] if nctl else 0
+            if c & 3 or not 0x760 <= nctl <= 0x2000 or c + nctl + ncode > len(m): c = m.find(CTL_MAGIC, c + 4); continue
+            ctl, code = m[c:c + nctl], m[c + nctl:c + nctl + ncode]
+            st = glslc_stage(ctl, code); why = check(label, st, ctl, code) if st else 'no code area right after it'
+            if why: print(f'[RED] {label}/{name} control section @{c:#x}: {why}; left out', flush=True)
+            else: out.append((f'{label}/{name}#IGA@{c:#x}', st, ctl, code))
+            c = m.find(CTL_MAGIC, c + nctl + ncode)
+    return out
+
 HEAPS_CACHE = 'shaders.cache.nx'
 
 def heaps_pak_files(f):
@@ -2536,6 +2599,9 @@ def scan_file_in(args):
         return rel, uniq_keys(found), var_pairs(found), trees
     if head[:4] == BND2:   # a Criterion Bundle 2 (Need for Speed: Hot Pursuit Remastered's SHADERS.BNDL): GLSLC outputs in its zlib resources (bnd2_shaders)
         found += bnd2_shaders(open(path, 'rb').read(), '/' + rel)
+        return rel, uniq_keys(found), var_pairs(found), trees
+    if head[:4] == IGA:   # an Alchemy archive (Crash Team Racing Nitro-Fueled's .pak): only its shaders/ members are decoded (alchemy_shaders)
+        found += alchemy_shaders(open(path, 'rb').read(), '/' + rel)
         return rel, uniq_keys(found), var_pairs(found), trees
     if head[:3] == b'PAK':   # a Heaps PAK archive (Dead Cells): only its shader cache is read, not its 2 GB of other files (heaps_pak_files, heaps_shaders)
         with open(path, 'rb') as f:
