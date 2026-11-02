@@ -2577,8 +2577,10 @@ def main(args=None):
         cap_dst.mkdir(parents=True, exist_ok=True)
         for gf in got: shutil.copy2(gf, cap_dst / gf.name)
         say(f'run-time shaders captured on the device: {len(got)} from {cap_src}')
-        on_device = False
-    if on_device:
+        # with --glslc-on-device as well, the app keeps saving the ones this capture lacks (a short run only reaches the shaders of the first screens: CTR's menu compiled 2 of 5)
+        if on_device: say('the app goes on saving run-time shaders to Documents/glslc_capture (--glslc-on-device): the ones not captured yet come with the next build')
+        else: capture_glslc(repo, {v: dirs[v] for v in sv}, pkg_ver, patched, work, env, logs, g)
+    elif on_device:
         say('[RED] run-time shaders: no Mac capture (--glslc-on-device); the app saves them to Documents/glslc_capture on the iPhone, for the next build (--glslc-files). '
             'Until then the game draws nothing with them')
     elif glslc: capture_glslc(repo, {v: dirs[v] for v in sv}, pkg_ver, patched, work, env, logs, g)
