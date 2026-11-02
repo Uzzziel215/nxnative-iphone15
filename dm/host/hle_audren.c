@@ -91,6 +91,15 @@ static _Atomic uint64_t g_frames, g_nonsilent;
 enum { CQ = 4 }; static int16_t g_cq[CQ][FRAME_MAX * 2]; static int g_cq_n[CQ]; static _Atomic uint32_t g_cq_head, g_cq_tail;   // output queue of catch-up frames
 static pthread_mutex_t g_cq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cq_cv = PTHREAD_COND_INITIALIZER;   // the render thread signals each frame it takes off the queue (catch-up pacing)
 static void cq_popped(void) { pthread_mutex_lock(&g_cq_mu); pthread_cond_broadcast(&g_cq_cv); pthread_mutex_unlock(&g_cq_mu); }
+// Renderers opened while the first is open. Crash Team Racing Nitro-Fueled (SDK 8.2) opens a 32 kHz renderer (2 voices) and then its main 48 kHz one (32 voices); with only the first
+// driven, nothing rendered the second, its event was never signaled, and the game stopped drawing about 20 s in (after the Activision logo) while the first renderer played on.
+// Each extra renderer gets a render thread and an output of its own (the outputs are mixed by the system, up to AOMAX). Its frames are rendered by that thread only: no catch-up queue,
+// and the renders do not count in g_renders, so the first renderer's catch-up rule is unchanged. t_xr marks the thread, so the ExecuteAudioRendererRendering takeovers write its frame
+enum { XR = 3 };
+typedef struct { void *handle[2]; _Atomic int open; void *tt; uint8_t *_Atomic sys; int16_t frame[FRAME_MAX * 2]; int frame_n; } xrend;
+static xrend g_xr[XR];
+static __thread xrend *t_xr;
+static int xr_is_sys(const uint8_t *sys) { for (int i = 0; i < XR; i++) if (atomic_load(&g_xr[i].open) && atomic_load(&g_xr[i].sys) == sys) return 1; return 0; }
 
 typedef struct { void *ptr; uint64_t cap, size; } gbuf;       // same as the front of hle_audio.c's AudioOutBuffer
 static void render_main(void *arg) {
@@ -121,6 +130,32 @@ static void render_main(void *arg) {
     }
     dm_pcmout_close(out);   // the output would otherwise keep its sound card callback or silent sink running and hold one of the AudioOut slots after the renderer closes
     cq_popped();   // an update waiting for queue space (catch-up pacing) sees g_open cleared
+}
+// An extra renderer's thread (g_xr): render_main without the catch-up queue, on an output of its own
+static void render_extra(void *arg) {
+    xrend *x = arg; t_xr = x;
+    void (*exec)(void *, void *) = gsym("_ZN2nn5audio29ExecuteAudioRendererRenderingENS0_19AudioRendererHandleE");
+    void *out = dm_pcmout_open(2);
+    int16_t (*data)[FRAME_MAX * 2] = calloc(NBUF, sizeof *data); gbuf bufs[NBUF], *free_list[NBUF]; int nfree = NBUF;
+    for (int i = 0; i < NBUF; i++) { bufs[i] = (gbuf){data[i], sizeof data[i], 0}; free_list[i] = &bufs[i]; }
+    dm_pcmout_start(out);
+    while (atomic_load(&x->open)) {
+        while (!nfree) {
+            gbuf *b = dm_pcmout_released(out);
+            if (b) { free_list[nfree++] = b; break; }
+            dm_pcmout_wait(out, 10);
+            if (!atomic_load(&x->open)) break;
+        }
+        if (!nfree) break;
+        x->frame_n = 0; exec(x->handle[0], x->handle[1]);   // the takeovers below render into x->frame (t_xr) and signal this renderer's event
+        int n = x->frame_n ? x->frame_n : 240;
+        gbuf *b = free_list[--nfree];
+        if (x->frame_n) memcpy(b->ptr, x->frame, (size_t)n * 4); else memset(b->ptr, 0, (size_t)n * 4);
+        b->size = (uint64_t)n * 4;
+        if (!dm_pcmout_append(out, b)) free_list[nfree++] = b;
+    }
+    dm_pcmout_close(out);
+    free(data);
 }
 
 // Both OpenAudioRenderer forms: CPU rendering + manual execution, then the host's render thread. With the event the game waits on it, which each render signals; without it the
@@ -198,7 +233,15 @@ static Result ar_open(void **handle, void *ev, const uint8_t *param, void *work,
             rev_set(sev, handle[0]);
         } else { destroy(ev); hle_bind_system_event(ev, 1); }   // no free renderer event: the earlier behaviour, which needs the game's object to live
     }
-    if (atomic_load(&g_open)) { LOG("[RED] audren: a second renderer (the host drives only one)"); return r; }
+    if (atomic_load(&g_open)) {
+        xrend *x = NULL;
+        for (int i = 0; i < XR && !x; i++) if (!atomic_load(&g_xr[i].open) && !g_xr[i].tt) x = &g_xr[i];
+        if (!x) { LOG("[RED] audren: renderer %d opened while %d are open (the host drives %d)", XR + 2, XR + 1, XR + 1); return r; }
+        x->handle[0] = handle[0]; x->handle[1] = handle[1]; atomic_store(&x->sys, NULL); x->frame_n = 0; atomic_store(&x->open, 1);
+        x->tt = dm_guest_thread_spawn(render_extra, x, 9, 0x10000);
+        LOG("audren: renderer %d (opened while the first is open) gets a render thread and an output of its own", (int)(x - g_xr) + 2);
+        return r;
+    }
     g_handle[0] = handle[0]; g_handle[1] = handle[1]; atomic_store(&g_open, 1);
     g_render_tt = dm_guest_thread_spawn(render_main, NULL, 9, 0x10000);
     return r;
@@ -212,6 +255,7 @@ HLE_FORCE("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE", "close 
     // Join the render thread first (it checks g_open every round and at most every 10 ms while waiting for the output): it may be inside exec(), which uses the renderer the SDK is about to free.
     // A fixed 20 ms sleep used to stand in for this, and a renderer reopened inside that window ran a second thread over the first one's static buffers
     if (obj == g_handle[0] && g_render_tt) { atomic_store(&g_open, 0); dm_guest_thread_join(g_render_tt); g_render_tt = NULL; }
+    for (int i = 0; i < XR; i++) if (g_xr[i].tt && g_xr[i].handle[0] == obj) { atomic_store(&g_xr[i].open, 0); dm_guest_thread_join(g_xr[i].tt); g_xr[i].tt = NULL; atomic_store(&g_xr[i].sys, NULL); }
     void *owned = objmap_del(obj), *sev = rev_find(obj);
     orig(obj, state);
     free(owned);
@@ -447,7 +491,8 @@ static Result render_once(uint8_t *sys, int16_t *dst, int *nout) {
     if (gen20) { span_t sp = gen20(sys, *(uint8_t **)(sys + 0xf8), *(size_t *)(sys + 0x100)); cl = sp.p; n = sp.n; }
     else { cl = cbuf(sys); n = gen(sys, cl, cbsz(sys)); }
     unlock(sys + mu_off);
-    atomic_fetch_add(&g_renders, 1);
+    if (t_xr) { if (!atomic_load(&t_xr->sys)) atomic_store(&t_xr->sys, sys); }   // an extra renderer's thread: its system is now known (h_ars_Update leaves it alone)
+    else atomic_fetch_add(&g_renders, 1);
     uint64_t proc[16] __attribute__((aligned(16))) = {0};   // CommandListProcessor (0x58 bytes; 0x60 in SDK 21, whose Process reads +0x58)
     tmax(proc, 0xffffffffu); setup(proc, cl, n); process(proc);
     if (dst) *nout = capture(cl, n, dst);
@@ -476,12 +521,12 @@ static size_t impl_sys_off(void) {
     return off;
 }
 HLE_FORCE("_ZN2nn5audio6server24AudioRendererManagerImpl17AudioRendererImpl29ExecuteAudioRendererRenderingEv", "render one frame manually: SDK generates commands + CPU processing, the host takes the DeviceSink output",
-          Result, h_ar_ImplExec, uint8_t *impl) { return render_once(impl + impl_sys_off(), g_frame, &g_frame_n); }
+          Result, h_ar_ImplExec, uint8_t *impl) { return t_xr ? render_once(impl + impl_sys_off(), t_xr->frame, &t_xr->frame_n) : render_once(impl + impl_sys_off(), g_frame, &g_frame_n); }
 // SDK 20 (The Legend of Zelda: Breath of the Wild 1.9.0): the public ExecuteAudioRendererRendering (sdk+0x221e90) calls the AudioRendererImpl version through the vtable (sdk+0x22ca88, just x0 += 0x60 and a jump through the PLT to here),
 // so the takeover above is never reached. The original generates commands here without the update lock; with the render thread on the original and the game thread's RequestUpdate rendering catch-up frames ("nothing rendered since the last update"),
 // both sides wrote the same command buffer at once and CommandListProcessor::Process sometimes read a half-written command list and crashed (once at 60 s and once at 134 s in the shrine). Taken over here, so rendering goes through the host's locked render as well
 HLE_FORCE("_ZN2nn5audio6server17AudioRenderSystem29ExecuteAudioRendererRenderingEv", "render one frame manually (SDK 20, reached through the PLT): same as above, through the host's locked rendering",
-          Result, h_ars_Exec, uint8_t *sys) { return render_once(sys, g_frame, &g_frame_n); }
+          Result, h_ars_Exec, uint8_t *sys) { return t_xr ? render_once(sys, t_xr->frame, &t_xr->frame_n) : render_once(sys, g_frame, &g_frame_n); }
 
 // At least one rendered frame between two RequestUpdates. An effect's "needs initialization" is set only by the update in which the game flags it as new (e.g. LightLimiterInfo::Update: isNew → parameter status 0);
 // the next update overwrites it with the game's value; if no commands were generated in between, the DSP never receives the initialization and ApplyLightLimiterEffect later reads a null pointer. The real renderer produces a frame every 5 ms on its own
@@ -497,6 +542,7 @@ HLE_FORCE("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm", "renderer
           Result, h_ars_Update, uint8_t *sys, void *o, size_t on, void *p, size_t pn, const void *in, size_t inn) {
     static Result (*orig)(void *, void *, size_t, void *, size_t, const void *, size_t); if (!orig) orig = gsym("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm");
     static uint64_t last_r = ~0ull;
+    if (xr_is_sys(sys)) return orig(sys, o, on, p, pn, in, inn);   // an extra renderer: its own thread renders every frame; the catch-up rule and its counters are the first renderer's
     uint64_t u = atomic_fetch_add(&g_updates, 1) + 1, r = atomic_load(&g_renders);
     if (last_r != ~0ull && r == last_r) {
         uint64_t c = atomic_fetch_add(&g_catchups, 1) + 1;
